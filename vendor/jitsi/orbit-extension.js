@@ -27,7 +27,13 @@
     mediaTracks: [],
     sessionHandle: "",
     reconnectTimer: null,
-    reconnectAttempts: 0
+    reconnectAttempts: 0,
+    sourceCount: 0,
+    remoteAudioCount: 0,
+    shareAudioCount: 0,
+    screenShareActive: false,
+    packetsSent: 0,
+    lastInputPeak: 0
   };
   var lastAction = { key: "", time: 0 };
 
@@ -326,6 +332,10 @@
     statusRow.appendChild(dot);
     statusRow.appendChild(statusText);
     body.appendChild(statusRow);
+    body.appendChild(element("div", {
+      id: "orbit-translation-debug",
+      style: "padding:7px 14px;border-bottom:1px solid rgba(128,128,128,.25);font-size:11px;line-height:1.35;opacity:.68;"
+    }, ["Audio sources: 0 • PCM packets: 0"]));
 
     var scroll = element("div", { style: "flex:1;min-height:0;overflow-y:auto;padding:12px 14px 16px;" });
     scroll.appendChild(element("div", { style: "font-size:12px;font-weight:700;opacity:.75;margin-bottom:4px;" }, ["Original"]));
@@ -488,30 +498,95 @@
     }
   }
 
-  function remoteAudioTracks() {
+  function isShareSourceType(value) {
+    return /screen|desktop|window|tab|display/i.test(String(value || ""));
+  }
+
+  function trackVideoType(track) {
+    var value = track && track.videoType ? track.videoType : "";
+    var jitsiTrack = track && track.jitsiTrack;
+    if (!value && jitsiTrack && typeof jitsiTrack.getVideoType === "function") {
+      try {
+        value = jitsiTrack.getVideoType() || "";
+      } catch (ignored) {
+        value = "";
+      }
+    }
+    return String(value || "").toLowerCase();
+  }
+
+  function addTranslationTrack(result, mediaTrack, signature) {
+    var id;
+    if (!mediaTrack || mediaTrack.kind !== "audio" || mediaTrack.readyState !== "live") {
+      return false;
+    }
+    id = mediaTrack.id || signature;
+    if (result.seen[id]) {
+      return false;
+    }
+    result.seen[id] = true;
+    result.tracks.push(mediaTrack);
+    result.signature.push(signature + ":" + id);
+    return true;
+  }
+
+  function translationMedia() {
     var store = appStore();
+    var result = {
+      tracks: [],
+      signature: [],
+      seen: {},
+      remoteAudioCount: 0,
+      shareAudioCount: 0,
+      screenShareActive: false
+    };
     var state;
     var tracks;
     if (!store) {
-      return [];
+      return result;
     }
     state = store.getState();
     tracks = state["features/base/tracks"] || [];
-    return tracks.filter(function(track) {
-      return track && track.mediaType === "audio" && !track.local && !track.muted && track.isReceivingData !== false && track.jitsiTrack && typeof track.jitsiTrack.getTrack === "function";
-    });
-  }
 
-  function remoteMedia() {
-    var tracks = remoteAudioTracks();
-    var mediaTracks = [];
-    var signature = [];
     tracks.forEach(function(track) {
-      var jitsiTrack = track.jitsiTrack;
+      var jitsiTrack = track && track.jitsiTrack;
       var mediaTrack = null;
-      var participantId = track.participantId || "remote";
+      var participantId = track && track.participantId ? track.participantId : "remote";
       var sourceName = "";
       var trackId = "";
+      var sourceType = "";
+
+      if (!track || !jitsiTrack) {
+        return;
+      }
+
+      // Jitsi keeps the browser getDisplayMedia stream on the local desktop
+      // video track. That original stream contains system/tab audio when the
+      // user checked "Share audio", even if Jitsi does not expose a separate
+      // local audio entry in the Redux track list.
+      if (track.local && track.mediaType === "video" && trackVideoType(track) === "desktop") {
+        result.screenShareActive = true;
+        if (typeof jitsiTrack.getOriginalStream === "function") {
+          try {
+            var originalStream = jitsiTrack.getOriginalStream();
+            if (originalStream && typeof originalStream.getAudioTracks === "function") {
+              originalStream.getAudioTracks().forEach(function(audioTrack) {
+                if (addTranslationTrack(result, audioTrack, "local-share-original")) {
+                  result.shareAudioCount += 1;
+                }
+              });
+            }
+          } catch (ignoredOriginalStream) {
+            // Continue and try an explicit share-audio track if Jitsi exposes one.
+          }
+        }
+        return;
+      }
+
+      if (track.mediaType !== "audio" || track.muted || track.isReceivingData === false || typeof jitsiTrack.getTrack !== "function") {
+        return;
+      }
+
       try {
         mediaTrack = jitsiTrack.getTrack();
         if (typeof jitsiTrack.getParticipantId === "function") {
@@ -523,22 +598,36 @@
         if (typeof jitsiTrack.getTrackId === "function") {
           trackId = jitsiTrack.getTrackId() || "";
         }
-      } catch (ignored) {
+        sourceType = jitsiTrack.sourceType || track.sourceType || "";
+      } catch (ignoredTrack) {
         mediaTrack = null;
       }
-      if (!mediaTrack || mediaTrack.kind !== "audio" || mediaTrack.readyState !== "live") {
-        return;
-      }
-      if (!trackId) {
+
+      if (!trackId && mediaTrack) {
         trackId = mediaTrack.id || "audio";
       }
-      mediaTracks.push(mediaTrack);
-      signature.push(String(participantId) + ":" + String(sourceName) + ":" + String(trackId));
+
+      // Every remote audio source is valid translator input.
+      if (!track.local) {
+        if (addTranslationTrack(result, mediaTrack, "remote:" + String(participantId) + ":" + String(sourceName) + ":" + String(trackId))) {
+          result.remoteAudioCount += 1;
+        }
+        return;
+      }
+
+      // Never translate the local microphone. Only explicit local share/system
+      // audio is admitted here to avoid feeding the listener's own speech back
+      // into Gemini.
+      if (isShareSourceType(sourceType) || trackVideoType(track) === "desktop") {
+        result.screenShareActive = true;
+        if (addTranslationTrack(result, mediaTrack, "local-share:" + String(sourceName) + ":" + String(trackId))) {
+          result.shareAudioCount += 1;
+        }
+      }
     });
-    if (!mediaTracks.length) {
-      return null;
-    }
-    return { tracks: mediaTracks, signature: signature.sort().join("|") };
+
+    result.signature = result.signature.sort().join("|");
+    return result;
   }
 
   function setTranslationStatus(text, color) {
@@ -551,6 +640,29 @@
       retry.style.display = translation.status === "error" ? "block" : "none";
     }
     void color;
+  }
+
+  function setTranslationDebug(text) {
+    var node = document.querySelector("#orbit-translation-debug");
+    if (node) {
+      node.textContent = text;
+    }
+  }
+
+  function updateTranslationDebug() {
+    var sources = translation.sourceCount || 0;
+    var parts = ["Audio sources: " + sources];
+    if (translation.shareAudioCount) {
+      parts.push("shared: " + translation.shareAudioCount);
+    }
+    if (translation.remoteAudioCount) {
+      parts.push("remote: " + translation.remoteAudioCount);
+    }
+    parts.push("PCM packets: " + (translation.packetsSent || 0));
+    if (translation.packetsSent) {
+      parts.push("signal: " + Math.round((translation.lastInputPeak || 0) * 100) + "%");
+    }
+    setTranslationDebug(parts.join(" • "));
   }
 
   function setTranslationText(kind, text) {
@@ -645,6 +757,13 @@
     translation.mediaTracks = [];
     translation.sessionHandle = "";
     translation.reconnectAttempts = 0;
+    translation.sourceCount = 0;
+    translation.remoteAudioCount = 0;
+    translation.shareAudioCount = 0;
+    translation.screenShareActive = false;
+    translation.packetsSent = 0;
+    translation.lastInputPeak = 0;
+    updateTranslationDebug();
     clearReconnectTimer();
     closeSocket();
     disconnectInput();
@@ -712,27 +831,48 @@
   }
 
   function syncTranslation() {
-    var remote;
+    var media;
     var expectedSignature;
     if (panel.active !== "translator") {
       return;
     }
-    remote = remoteMedia();
-    if (!remote) {
+    media = translationMedia();
+
+    translation.sourceCount = media.tracks.length;
+    translation.remoteAudioCount = media.remoteAudioCount;
+    translation.shareAudioCount = media.shareAudioCount;
+    translation.screenShareActive = media.screenShareActive;
+    updateTranslationDebug();
+
+    if (!media.tracks.length) {
       if (translation.signature || translation.status === "connecting" || translation.status === "listening" || translation.status === "playing") {
         stopTranslation(true);
+        translation.screenShareActive = media.screenShareActive;
+        updateTranslationDebug();
       }
       translation.status = "idle";
-      setTranslationStatus("Waiting for participant audio.", "#888");
-      setTranslationText("source", translation.source || "Waiting for participant audio.");
+      if (media.screenShareActive) {
+        setTranslationStatus("Screen share detected, but no shared audio track is available.", "#888");
+        setTranslationText("source", "Re-share the tab/window and enable Share audio.");
+      } else {
+        setTranslationStatus("Waiting for participant or shared-screen audio.", "#888");
+        setTranslationText("source", translation.source || "Waiting for participant or shared-screen audio.");
+      }
       return;
     }
-    expectedSignature = remote.signature + "|" + panel.target;
+
+    expectedSignature = media.signature + "|" + panel.target;
     if (translation.signature === expectedSignature && (translation.socket || translation.reconnectTimer || translation.status === "connecting")) {
       return;
     }
+
     stopTranslation(true);
-    startTranslation(remote.tracks, expectedSignature, panel.target);
+    translation.sourceCount = media.tracks.length;
+    translation.remoteAudioCount = media.remoteAudioCount;
+    translation.shareAudioCount = media.shareAudioCount;
+    translation.screenShareActive = media.screenShareActive;
+    updateTranslationDebug();
+    startTranslation(media.tracks, expectedSignature, panel.target);
   }
 
   function startTranslation(mediaTracks, signature, target) {
@@ -748,7 +888,10 @@
     translation.mediaTracks = mediaTracks.slice();
     translation.sessionHandle = "";
     translation.reconnectAttempts = 0;
-    setTranslationStatus("Connecting…", "#ffd479");
+    translation.packetsSent = 0;
+    translation.lastInputPeak = 0;
+    updateTranslationDebug();
+    setTranslationStatus("Connecting to live translator…", "#ffd479");
     setTranslationText("source", "Listening…");
     setTranslationText("translated", "Translation will appear here.");
     try {
@@ -881,7 +1024,8 @@
       if (message.setupComplete) {
         translation.status = "listening";
         translation.reconnectAttempts = 0;
-        setTranslationStatus("Listening for remote speech.", "#8fd49a");
+        setTranslationStatus("Live translator connected. Listening…", "#8fd49a");
+        updateTranslationDebug();
         startInput(mediaTracks, generation);
         return;
       }
@@ -995,6 +1139,8 @@
       processor = input.createScriptProcessor(1024, 1, 1);
       processor.onaudioprocess = function(event) {
         var live;
+        var peak = 0;
+        var i;
         if (generation !== translation.generation || !translation.socket || translation.socket.readyState !== 1) {
           return;
         }
@@ -1003,6 +1149,14 @@
           return;
         }
         live = downsample(event.inputBuffer.getChannelData(0), input.sampleRate);
+        for (i = 0; i < live.length; i += 1) {
+          peak = Math.max(peak, Math.abs(live[i]));
+        }
+        translation.lastInputPeak = peak;
+        translation.packetsSent += 1;
+        if (translation.packetsSent === 1 || translation.packetsSent % 10 === 0) {
+          updateTranslationDebug();
+        }
         translation.socket.send(JSON.stringify({
           realtimeInput: {
             audio: { data: floatToBase64(live), mimeType: "audio/pcm;rate=16000" }
@@ -1016,7 +1170,7 @@
       input.resume().catch(function() { return null; });
     } catch (inputError) {
       disconnectInput();
-      setTranslationError("This browser cannot capture remote meeting audio.");
+      setTranslationError("This browser cannot capture meeting or shared-screen audio.");
     }
   }
 
