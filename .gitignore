@@ -9,3 +9,6 @@ screenshots/
 .grok/preview.pid
 .grok/status
 .node_modules.lock
+.DS_Store
+working-live-translator/
+working-live-translator.zip
