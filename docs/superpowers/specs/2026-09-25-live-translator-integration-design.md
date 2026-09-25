@@ -18,10 +18,18 @@ Add the working live translator behavior from `working-live-translator` to the a
 - Use `gemini-3.5-live-translate-preview`, matching the reference app.
 - Read `GEMINI_API_KEY` from the Vercel server environment. Never commit or send the raw key to the browser.
 - Mint a short-lived, one-use server token when the user starts a session.
+  The locked token config matches the reference setup message exactly
+  (`responseModalities: ["AUDIO"]`, top-level input/output transcription,
+  `translationConfig` with `echoTargetLanguage: true`); the setup window is
+  12 minutes to cover slow networks.
 - Connect the browser directly to the Gemini bidirectional WebSocket using the ephemeral token.
 - Send 16 kHz mono PCM frames in `realtimeInput` messages.
 - Receive 24 kHz PCM audio and input/output transcriptions.
 - Queue translated audio in one output context and reset the queue on interruption.
+- Capture input with an AudioWorklet (`orbit-capture`, ported from the
+  reference `relay-capture` processor) with a ScriptProcessor fallback.
+- Accumulate incremental transcript chunks into per-turn buffers and close the
+  turn on `turnComplete`, matching the reference pending/commit display.
 
 ## Audio source selection
 
@@ -30,7 +38,12 @@ The extension will inspect Jitsi base tracks and create a single incoming `Media
 - Include live, unmuted remote audio tracks.
 - Include live screen-share audio tracks when Jitsi identifies them as screen-share or otherwise non-microphone audio.
 - Exclude local microphone tracks.
-- Exclude video tracks and tracks without an attachable Jitsi audio source.
+- Exclude video tracks and tracks without a live underlying audio track.
+- Pull the live `MediaStreamTrack`s directly from the Jitsi track objects
+  (`getOriginalStream` / `stream` / `track`, whichever the running
+  lib-jitsi-meet exposes) — the reference client's direct-stream approach.
+  Never re-attach tracks to hidden elements and never round-trip through
+  `captureStream`.
 - Refresh the source signature when participants or screen shares change. Restart the model session only when the eligible source set changes.
 
 The implementation will not call `getUserMedia` for translation and will not create a separate local microphone capture.

@@ -31,7 +31,9 @@ export const Route = createFileRoute("/api/translate-token")({
             config: {
               uses: 1,
               expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
-              newSessionExpireTime: new Date(now + 60 * 1000).toISOString(),
+              // Match the working reference app: the setup window must cover
+              // token fetch + socket open + setup round-trip on slow networks.
+              newSessionExpireTime: new Date(now + 12 * 60 * 1000).toISOString(),
               liveConnectConstraints: {
                 model: MODEL,
                 config: {
@@ -40,7 +42,9 @@ export const Route = createFileRoute("/api/translate-token")({
                   outputAudioTranscription: {},
                   translationConfig: {
                     targetLanguageCode: body.targetLanguageCode,
-                    echoTargetLanguage: false,
+                    // Must match the setup message sent by the browser client
+                    // exactly — locked fields that differ reject the handshake.
+                    echoTargetLanguage: true,
                   },
                 },
               },

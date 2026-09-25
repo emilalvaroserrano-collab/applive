@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { GoogleGenAI, Modality, type Session } from "@google/genai";
+import {
+  LiveTranslateClient,
+  type TranscriptLine,
+} from "@/lib/translate/live-translate-client";
 
 export type TranslationStatus = "idle" | "connecting" | "listening" | "playing" | "error";
 
@@ -17,57 +20,37 @@ const INITIAL_STATE: TranslationState = {
   error: null,
 };
 
-function floatToPcm16(input: Float32Array) {
-  const buffer = new ArrayBuffer(input.length * 2);
-  const view = new DataView(buffer);
-  for (let index = 0; index < input.length; index += 1) {
-    const sample = Math.max(-1, Math.min(1, input[index]));
-    view.setInt16(index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+function lastLineText(lines: TranscriptLine[], role: "source" | "translation"): string {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (line && line.role === role && line.text) return line.text;
   }
-  return new Uint8Array(buffer);
+  return "";
 }
 
-function bytesToBase64(bytes: Uint8Array) {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(value: string) {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
-}
-
-async function playPcm(bytes: Uint8Array, context: AudioContext, nextTime: { value: number }) {
-  const samples = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
-  const buffer = context.createBuffer(1, samples.length, 24000);
-  const channel = buffer.getChannelData(0);
-  for (let index = 0; index < samples.length; index += 1) {
-    channel[index] = samples[index] / 32768;
-  }
-  const source = context.createBufferSource();
-  source.buffer = buffer;
-  source.connect(context.destination);
-  const startAt = Math.max(context.currentTime + 0.03, nextTime.value);
-  source.start(startAt);
-  nextTime.value = startAt + buffer.duration;
-}
-
+/**
+ * Live translation for the React meeting UI, driven by the same
+ * LiveTranslateClient engine as the working reference app: ephemeral token
+ * over the Constrained WebSocket endpoint, AudioWorklet capture, PCM
+ * playback, and buffered transcripts.
+ *
+ * Meeting semantics: the incoming remote stream is the translation source
+ * and the local microphone is always muted — your own voice is never
+ * translated.
+ */
 export function useLiveTranslation(stream: MediaStream | null, enabled: boolean, targetLanguageCode: string) {
   const [state, setState] = useState<TranslationState>(INITIAL_STATE);
   const [attempt, setAttempt] = useState(0);
-  const sessionRef = useRef<Session | null>(null);
+  const clientRef = useRef<LiveTranslateClient | null>(null);
+  const playingTimer = useRef<number | null>(null);
 
   const restart = useCallback(() => {
-    sessionRef.current?.close();
-    sessionRef.current = null;
+    if (playingTimer.current !== null) {
+      window.clearTimeout(playingTimer.current);
+      playingTimer.current = null;
+    }
+    void clientRef.current?.stop("idle");
+    clientRef.current = null;
     setState(INITIAL_STATE);
     setAttempt((value) => value + 1);
   }, []);
@@ -75,13 +58,19 @@ export function useLiveTranslation(stream: MediaStream | null, enabled: boolean,
   useEffect(() => {
     if (!enabled || !stream) return;
     const sourceStream = stream;
-
+    const language = targetLanguageCode;
     let cancelled = false;
-    let inputContext: AudioContext | null = null;
-    let outputContext: AudioContext | null = null;
-    let source: MediaStreamAudioSourceNode | null = null;
-    let processor: ScriptProcessorNode | null = null;
-    const nextPlaybackTime = { value: 0 };
+
+    function markPlaying() {
+      setState((current) => (current.status === "playing" ? current : { ...current, status: "playing" }));
+      if (playingTimer.current !== null) window.clearTimeout(playingTimer.current);
+      playingTimer.current = window.setTimeout(() => {
+        playingTimer.current = null;
+        if (!cancelled) {
+          setState((current) => (current.status === "playing" ? { ...current, status: "listening" } : current));
+        }
+      }, 3000);
+    }
 
     async function start() {
       setState({ ...INITIAL_STATE, status: "connecting" });
@@ -89,97 +78,61 @@ export function useLiveTranslation(stream: MediaStream | null, enabled: boolean,
         const response = await fetch("/api/translate-token", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ targetLanguageCode }),
+          body: JSON.stringify({ targetLanguageCode: language }),
         });
         const payload = (await response.json()) as { token?: string; model?: string; error?: string };
         if (!response.ok || !payload.token || !payload.model) {
           throw new Error(payload.error ?? "Translation could not start.");
         }
-
         if (cancelled) return;
-        inputContext = new AudioContext({ sampleRate: 16000 });
-        outputContext = new AudioContext({ sampleRate: 24000 });
-        await Promise.all([inputContext.resume(), outputContext.resume()]);
 
-        const ai = new GoogleGenAI({ apiKey: payload.token, apiVersion: "v1alpha" });
-        const config = {
-          responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          translationConfig: {
-            targetLanguageCode,
-            echoTargetLanguage: false,
+        const client = new LiveTranslateClient({
+          onStatus: (status) => {
+            if (cancelled) return;
+            if (status === "live") {
+              setState((current) => ({ ...current, status: "listening", error: null }));
+            } else if (status === "connecting") {
+              setState((current) => ({ ...current, status: "connecting" }));
+            } else if (status === "idle") {
+              setState((current) => ({ ...current, status: "idle" }));
+            }
           },
-        };
-        const session = await ai.live.connect({
-          model: payload.model,
-          config,
-          callbacks: {
-            onopen: () => {
-              if (!cancelled) setState((current) => ({ ...current, status: "listening" }));
-            },
-            onmessage: (message) => {
-              const content = message.serverContent;
-              if (content?.interrupted) {
-                nextPlaybackTime.value = outputContext?.currentTime ?? 0;
-              }
-              if (content?.inputTranscription?.text) {
-                setState((current) => ({ ...current, sourceText: content.inputTranscription?.text ?? "" }));
-              }
-              if (content?.outputTranscription?.text) {
-                setState((current) => ({
-                  ...current,
-                  translatedText: content.outputTranscription?.text ?? "",
-                  status: "playing",
-                }));
-              }
-              for (const part of content?.modelTurn?.parts ?? []) {
-                const audio = part.inlineData;
-                if (!audio?.data || !audio.mimeType?.startsWith("audio/")) continue;
-                setState((current) => ({ ...current, status: "playing" }));
-                if (outputContext) {
-                  void playPcm(base64ToBytes(audio.data), outputContext, nextPlaybackTime);
-                }
-              }
-              if (content?.turnComplete) {
-                setState((current) => ({ ...current, status: "listening" }));
-              }
-            },
-            onerror: () => {
-              if (!cancelled) {
-                setState((current) => ({ ...current, status: "error", error: "Translation connection failed." }));
-              }
-            },
-            onclose: () => {
-              if (!cancelled) {
-                setState((current) => ({ ...current, status: "idle" }));
-              }
-            },
+          onError: (message) => {
+            if (cancelled) return;
+            setState((current) => ({
+              ...current,
+              status: "error",
+              error: message || "Translation connection failed.",
+            }));
+          },
+          onInputLevel: () => {},
+          onTranscripts: (lines) => {
+            if (cancelled) return;
+            const sourceText = lastLineText(lines, "source");
+            const translatedText = lastLineText(lines, "translation");
+            setState((current) => ({
+              ...current,
+              sourceText: sourceText || current.sourceText,
+              translatedText: translatedText || current.translatedText,
+            }));
+            if (translatedText) markPlaying();
           },
         });
-
-        if (cancelled) {
-          session.close();
-          return;
-        }
-        sessionRef.current = session;
-        source = inputContext.createMediaStreamSource(sourceStream);
-        processor = inputContext.createScriptProcessor(2048, 1, 1);
-        processor.onaudioprocess = (event) => {
-          event.outputBuffer.getChannelData(0).fill(0);
-          if (!sessionRef.current) return;
-          const pcm = floatToPcm16(event.inputBuffer.getChannelData(0));
-          sessionRef.current.sendRealtimeInput({
-            audio: {
-              data: bytesToBase64(pcm),
-              mimeType: "audio/pcm;rate=16000",
-            },
-          });
-        };
-        source.connect(processor);
-        processor.connect(inputContext.destination);
+        clientRef.current = client;
+        // Meeting rule: never translate the local microphone.
+        client.setMicMuted(true);
+        await client.start(
+          {
+            mode: "token",
+            token: payload.token,
+            model: payload.model,
+            targetLanguage: language,
+          },
+          { displayStream: sourceStream },
+        );
       } catch (error) {
         if (cancelled) return;
+        clientRef.current = null;
         setState({
           ...INITIAL_STATE,
           status: "error",
@@ -191,12 +144,13 @@ export function useLiveTranslation(stream: MediaStream | null, enabled: boolean,
     void start();
     return () => {
       cancelled = true;
-      sessionRef.current?.close();
-      sessionRef.current = null;
-      processor?.disconnect();
-      source?.disconnect();
-      void inputContext?.close();
-      void outputContext?.close();
+      if (playingTimer.current !== null) {
+        window.clearTimeout(playingTimer.current);
+        playingTimer.current = null;
+      }
+      const client = clientRef.current;
+      clientRef.current = null;
+      void client?.stop("idle");
     };
   }, [attempt, enabled, stream, targetLanguageCode]);
 

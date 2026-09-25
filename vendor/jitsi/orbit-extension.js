@@ -2,12 +2,17 @@
   var TRANSLATOR_ID = "orbit-translator";
   var DONATE_ID = "orbit-donate";
   var LIVE_MODEL = "models/gemini-3.5-live-translate-preview";
-  var LIVE_SOCKET_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+  // Ephemeral mint tokens go to the Constrained endpoint via access_token
+  // (never ?key= — that slot is for API keys and the handshake is refused).
+  var LIVE_SOCKET_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained";
   var POLL_MS = 1500;
   var DONATION_AMOUNTS = [10, 25, 50, 100];
-  var panel = { active: null, target: "en", languages: null, languagesLoading: false };
-  var translation = { status: "idle", error: "", source: "", translated: "", signature: "", generation: 0, socket: null, input: null, output: null, sourceNode: null, processor: null, nextTime: 0, playing: [] };
-  var hiddenAudio = [];
+  var panel = { active: null, target: "nl", languages: null, languagesLoading: false };
+  // wantActive = user pressed Start and has not pressed Stop / closed the panel.
+  // The model session stays up until Stop, panel close, or track failure.
+  // Translation input is remote + screenshare audio only — never the local mic
+  // (no getUserMedia anywhere in this file).
+  var translation = { status: "idle", wantActive: false, error: "", source: "", sourceBuffer: "", sourceLang: "", speaker: "", translated: "", translationBuffer: "", turnClosed: true, signature: "", generation: 0, socket: null, input: null, output: null, sourceNode: null, processor: null, nextTime: 0, playing: [], ducked: false, restoreTimer: null, duckVolumes: null };
   var lastAction = { key: "", time: 0 };
 
   function appStore() {
@@ -101,6 +106,7 @@
   function closeWrapper() {
     var store = appStore();
     panel.active = null;
+    translation.wantActive = false;
     setPanelSide(null);
     stopTranslation();
     try {
@@ -138,6 +144,7 @@
     if (panel.active === mode && state && state.isOpen) {
       closeWrapper();
     } else {
+      translation.wantActive = false;
       stopTranslation();
       openPanel(mode);
     }
@@ -168,7 +175,13 @@
     var original = api.notifyToolbarButtonClicked;
     var wrapped = function() {
       try {
-        handleToolbarKey(normalizeKey(arguments.length > 0 ? arguments[0] : ""));
+        // The document capture listener fires first for the same physical
+        // click; skip this duplicate so one click toggles exactly once.
+        var key = normalizeKey(arguments.length > 0 ? arguments[0] : "");
+        var id = key === TRANSLATOR_ID ? "translator" : key === DONATE_ID ? "donate" : null;
+        if (id && !(Date.now() - lastAction.time < 500 && lastAction.key === key)) {
+          handleToolbarKey(key);
+        }
       } catch (ignored) {
         return original.apply(this, arguments);
       }
@@ -282,15 +295,22 @@
   function renderTranslator() {
     var body = element("div", { style: "display:flex;flex-direction:column;min-height:0;flex:1;" });
     var top = element("div", { style: "padding:12px 14px;border-bottom:1px solid rgba(128,128,128,.35);" });
-    var label = element("label", { htmlFor: "orbit-language", style: "display:block;font-size:13px;font-weight:600;margin-bottom:8px;" }, ["Translate incoming speech into"]);
+    var label = element("label", { htmlFor: "orbit-language", style: "display:block;font-size:13px;font-weight:600;margin-bottom:8px;" }, ["Translate incoming audio to:"]);
     var select = element("select", { id: "orbit-language", style: "width:100%;height:42px;border:1px solid rgba(128,128,128,.55);border-radius:8px;background:rgba(0,0,0,.18);color:inherit;padding:0 10px;font-size:14px;" });
     select.appendChild(element("option", { value: "", text: "Loading languages…" }));
     select.addEventListener("change", function() {
       if (!select.value) {
         return;
       }
+      var changed = select.value !== panel.target;
       panel.target = select.value;
-      syncTranslation();
+      updateTargetLabel();
+      if (changed && translation.wantActive) {
+        // Re-mint a session for the new language without leaving the meeting.
+        // Transcripts are kept; the socket reconnects automatically.
+        translation.signature = "";
+        syncTranslation();
+      }
     });
     top.appendChild(label);
     top.appendChild(select);
@@ -298,14 +318,34 @@
 
     var statusRow = element("div", { style: "display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid rgba(128,128,128,.35);font-size:13px;opacity:.9;" });
     var dot = statusDot("#888");
-    var statusText = element("span", { id: "orbit-translation-status", text: "Starting…" });
+    var statusText = element("span", { id: "orbit-translation-status", text: "Idle." });
     statusRow.appendChild(dot);
     statusRow.appendChild(statusText);
     body.appendChild(statusRow);
 
+    body.appendChild(element("div", { id: "orbit-sources", style: "padding:8px 14px;border-bottom:1px solid rgba(128,128,128,.35);font-size:12.5px;line-height:1.4;opacity:.8;" }, ["Checking audio…"]));
+
+    var controls = element("div", { style: "padding:12px 14px;border-bottom:1px solid rgba(128,128,128,.35);" });
+    var toggle = element("button", { id: "orbit-translate-toggle", type: "button", style: "width:100%;height:44px;border-radius:8px;border:0;background:#e7e9ee;color:#0a0a0b;font-size:14px;font-weight:700;cursor:pointer;" }, ["Start Translation"]);
+    toggle.addEventListener("click", function() {
+      if (translation.wantActive) {
+        translation.wantActive = false;
+        stopTranslation();
+        translation.status = "idle";
+        setTranslationStatus("Stopped.", "#888");
+        refreshToggle();
+        return;
+      }
+      translation.wantActive = true;
+      translation.error = "";
+      syncTranslation();
+    });
+    controls.appendChild(toggle);
+    body.appendChild(controls);
+
     var scroll = element("div", { style: "flex:1;min-height:0;overflow-y:auto;padding:12px 14px 16px;" });
-    scroll.appendChild(element("div", { style: "font-size:12px;font-weight:700;opacity:.75;margin-bottom:4px;" }, ["Original"]));
-    scroll.appendChild(element("div", { id: "orbit-source-text", style: "font-size:14px;line-height:1.45;margin-bottom:14px;" }, ["Waiting for participant audio."]));
+    scroll.appendChild(element("div", { id: "orbit-source-label", style: "font-size:12px;font-weight:700;opacity:.75;margin-bottom:4px;" }, ["Original"]));
+    scroll.appendChild(element("div", { id: "orbit-source-text", style: "font-size:14px;line-height:1.45;margin-bottom:14px;" }, ["Waiting for audio to translate."]));
     scroll.appendChild(element("div", { id: "orbit-target-label", style: "font-size:12px;font-weight:700;opacity:.75;margin-bottom:4px;" }, ["Translation"]));
     scroll.appendChild(element("div", { id: "orbit-translated-text", style: "font-size:14px;line-height:1.45;" }, ["Translation will appear here."]));
     scroll.appendChild(element("div", { style: "margin-top:14px;" }, [
@@ -316,8 +356,14 @@
     var retry = scroll.querySelector("#orbit-retry");
     if (retry) {
       retry.addEventListener("click", function() {
-        stopTranslation();
-        syncTranslation();
+        translation.error = "";
+        if (translation.wantActive) {
+          translation.signature = "";
+          syncTranslation();
+        } else {
+          translation.wantActive = true;
+          syncTranslation();
+        }
       });
     }
     loadLanguages(function(languages) {
@@ -328,6 +374,7 @@
       if (!languages.length) {
         select.appendChild(element("option", { value: "", text: "Languages unavailable" }));
         setTranslationError("The language list could not be loaded. Please try again.");
+        refreshToggle();
         return;
       }
       languages.forEach(function(language) {
@@ -340,10 +387,73 @@
         }
         select.appendChild(option);
       });
-      syncTranslation();
+      updateTargetLabel();
+      refreshToggle();
+      // Do NOT auto-start: the user taps Start Translation explicitly.
+      if (!translation.wantActive) {
+        setTranslationStatus("Idle.", "#888");
+      } else {
+        syncTranslation();
+      }
     });
-    window.setTimeout(syncTranslation, 50);
+    window.setTimeout(function() {
+      updateTargetLabel();
+      refreshToggle();
+      if (translation.wantActive) {
+        syncTranslation();
+      } else {
+        setTranslationStatus("Idle.", "#888");
+      }
+    }, 50);
     return panelShell("Translator", body);
+  }
+
+  function refreshToggle() {
+    var toggle = document.querySelector("#orbit-translate-toggle");
+    if (!toggle) {
+      return;
+    }
+    if (translation.wantActive) {
+      toggle.textContent = "Stop Translation";
+      toggle.style.background = "#c34747";
+      toggle.style.color = "#ffffff";
+    } else {
+      toggle.textContent = "Start Translation";
+      toggle.style.background = "#e7e9ee";
+      toggle.style.color = "#0a0a0b";
+    }
+    var remote = null;
+    try {
+      remote = remoteMedia();
+    } catch (ignored) {
+      remote = null;
+    }
+    updateSources(remote);
+    toggle.disabled = !translation.wantActive && !remote;
+    toggle.style.opacity = toggle.disabled ? ".55" : "1";
+    toggle.style.cursor = toggle.disabled ? "not-allowed" : "pointer";
+  }
+
+  function updateTargetLabel() {
+    var node = document.querySelector("#orbit-target-label");
+    if (node) {
+      node.textContent = languageName(panel.target);
+    }
+  }
+
+  function updateSourceLabel() {
+    var node = document.querySelector("#orbit-source-label");
+    if (!node) {
+      return;
+    }
+    var parts = [];
+    if (translation.speaker) {
+      parts.push(translation.speaker);
+    }
+    if (translation.sourceLang) {
+      parts.push(languageName(translation.sourceLang));
+    }
+    node.textContent = parts.length ? parts.join(" — ") : "Original";
   }
 
   function renderDonate() {
@@ -435,6 +545,79 @@
       });
   }
 
+  // Translation sources: remote participant audio AND shared-screen audio —
+  // including the current user's own shared-screen audio, so a local tab or
+  // screen share with sound is translated and played back for the current
+  // user too. The local microphone is always excluded (never part of the
+  // input stream). Like the working reference client, live MediaStreamTracks
+  // are pulled directly from the Jitsi tracks into the input AudioContext —
+  // never re-attached to hidden elements, never round-tripped through
+  // captureStream.
+  function isScreenshareTrack(track) {
+    if (!track) {
+      return false;
+    }
+    if (track.videoType === "desktop" || track.videoType === "screenshare") {
+      return true;
+    }
+    var jt = track.jitsiTrack || {};
+    if (jt.videoType === "desktop" || jt.videoType === "screenshare") {
+      return true;
+    }
+    if (typeof jt.isScreenshare === "function") {
+      try {
+        if (jt.isScreenshare()) {
+          return true;
+        }
+      } catch (ignored) {
+        return false;
+      }
+    }
+    // System-audio / tab-audio shares often surface without a desktop flag
+    // but carry it in the underlying MediaStreamTrack label.
+    var labels = [];
+    try {
+      if (track.track && track.track.label) {
+        labels.push(String(track.track.label));
+      }
+    } catch (ignoredLabel) {
+      return false;
+    }
+    try {
+      if (jt.track && jt.track.label) {
+        labels.push(String(jt.track.label));
+      }
+    } catch (ignoredJitsiLabel) {
+      return false;
+    }
+    var index;
+    for (index = 0; index < labels.length; index += 1) {
+      if (/screen|share|system audio|tab audio|desktop/i.test(labels[index])) {
+        return true;
+      }
+    }
+    var pid = String(track.participantId || jt.ownerEndpointId || "");
+    if (/screenshare|screen-share|desktop/i.test(pid)) {
+      return true;
+    }
+    return false;
+  }
+
+  function trackIdentity(track) {
+    var jt = track.jitsiTrack || {};
+    try {
+      if (jt && typeof jt.getId === "function" && jt.getId()) {
+        return String(jt.getId());
+      }
+    } catch (ignored) {
+      return "";
+    }
+    if (track.id) {
+      return String(track.id);
+    }
+    return String(track.participantId || "remote");
+  }
+
   function remoteAudioTracks() {
     var store = appStore();
     var state;
@@ -445,113 +628,449 @@
     state = store.getState();
     tracks = state["features/base/tracks"] || [];
     return tracks.filter(function(track) {
-      return track && track.mediaType === "audio" && !track.local && !track.muted && track.isReceivingData !== false && track.jitsiTrack && typeof track.jitsiTrack.attach === "function" && typeof track.jitsiTrack.detach === "function";
-    });
-  }
-
-  function pruneHiddenAudio(live) {
-    hiddenAudio = hiddenAudio.filter(function(entry) {
-      var alive = live.some(function(track) {
-        return track.jitsiTrack === entry.jitsi;
-      });
-      if (!alive) {
-        try {
-          entry.jitsi.detach(entry.element);
-        } catch (ignored) {
-          return false;
-        }
-        if (entry.element.parentNode) {
-          entry.element.parentNode.removeChild(entry.element);
-        }
+      if (!track || track.mediaType !== "audio") {
+        return false;
+      }
+      // Local microphone is never translated; a local screenshare-audio
+      // track (desktop / system-audio share) is a valid source.
+      if (track.local && !isScreenshareTrack(track)) {
+        return false;
+      }
+      if (track.muted) {
+        return false;
+      }
+      // Receiving-data is a remote/bridge concept; local shares are live
+      // captures and must not be gated on it.
+      if (!track.local && track.isReceivingData === false) {
+        return false;
+      }
+      // The track must expose at least one live audio MediaStreamTrack —
+      // pulled directly from the Jitsi track, never re-attached.
+      var usable = false;
+      try {
+        usable = directAudioTracks(track).length > 0;
+      } catch (ignoredUsable) {
+        usable = false;
+      }
+      if (!usable) {
         return false;
       }
       return true;
     });
   }
 
-  function attachTrack(track) {
-    var entry = null;
-    var index;
-    for (index = 0; index < hiddenAudio.length; index += 1) {
-      if (hiddenAudio[index].jitsi === track.jitsiTrack) {
-        entry = hiddenAudio[index];
-      }
+  // One entry per audio track in the Jitsi store, with the include/exclude
+  // reason. Powers the sidebar source line and window.__orbitTranslatorDebug.
+  function describeAudioTracks() {
+    var store = appStore();
+    var out = [];
+    var state;
+    var tracks;
+    if (!store) {
+      return out;
     }
-    if (!entry) {
-      var audio = document.createElement("audio");
-      audio.muted = true;
-      audio.setAttribute("aria-hidden", "true");
-      audio.style.position = "absolute";
-      audio.style.width = "1px";
-      audio.style.height = "1px";
-      audio.style.left = "-9999px";
-      audio.style.opacity = "0";
-      audio.style.pointerEvents = "none";
-      document.body.appendChild(audio);
-      entry = { jitsi: track.jitsiTrack, element: audio, ready: false };
-      hiddenAudio.push(entry);
+    try {
+      state = store.getState();
+    } catch (ignoredState) {
+      return out;
+    }
+    tracks = state["features/base/tracks"] || [];
+    tracks.forEach(function(track) {
+      var reasons = [];
+      var labels = [];
+      var ss = false;
+      var liveTracks = 0;
+      if (!track || track.mediaType !== "audio") {
+        return;
+      }
+      ss = isScreenshareTrack(track);
+      if (track.local && !ss) {
+        reasons.push("microphone");
+      }
+      if (track.muted) {
+        reasons.push("muted");
+      }
+      if (!track.local && track.isReceivingData === false) {
+        reasons.push("not-receiving");
+      }
       try {
-        var attached = track.jitsiTrack.attach(audio);
-        if (attached && typeof attached.then === "function") {
-          attached.then(function() {
-            entry.ready = true;
-            return null;
-          }).catch(function() {
-            entry.failed = true;
-          });
+        liveTracks = directAudioTracks(track).length;
+      } catch (ignoredLive) {
+        liveTracks = 0;
+      }
+      if (!liveTracks) {
+        reasons.push("no-audio-track");
+      }
+      try {
+        if (track.track && track.track.label) {
+          labels.push(String(track.track.label));
+        }
+      } catch (ignoredTrack) {
+        return;
+      }
+      try {
+        if (track.jitsiTrack && track.jitsiTrack.track && track.jitsiTrack.track.label) {
+          labels.push(String(track.jitsiTrack.track.label));
+        }
+      } catch (ignoredJitsiTrack) {
+        return;
+      }
+      out.push({
+        local: !!track.local,
+        muted: !!track.muted,
+        receiving: track.isReceivingData,
+        videoType: track.videoType || (track.jitsiTrack && track.jitsiTrack.videoType) || "",
+        labels: labels,
+        screenshare: ss,
+        liveTracks: liveTracks,
+        included: reasons.length === 0,
+        reasons: reasons
+      });
+    });
+    return out;
+  }
+
+  function sourceSummary(remote) {
+    var screens = 0;
+    var others = 0;
+    var parts = [];
+    if (remote && remote.tracks && remote.tracks.length) {
+      remote.tracks.forEach(function(track) {
+        if (isScreenshareTrack(track)) {
+          screens += 1;
         } else {
-          entry.ready = true;
+          others += 1;
         }
-      } catch (ignored) {
-        entry.failed = true;
+      });
+      if (screens) {
+        parts.push(screens === 1 ? "shared-screen audio" : screens + " shared screens");
       }
-      try {
-        var played = audio.play();
-        if (played && typeof played.catch === "function") {
-          played.catch(function() {
-            return null;
-          });
-        }
-      } catch (ignoredPlay) {
-        return entry;
+      if (others) {
+        parts.push(others === 1 ? "1 participant" : others + " participants");
+      }
+      return "Source: " + parts.join(" + ");
+    }
+    var desc = describeAudioTracks();
+    if (!desc.length) {
+      return "No audio in this meeting yet.";
+    }
+    if (desc.every(function(d) { return d.local && !d.screenshare; })) {
+      return "Only your microphone found — share a tab with audio, or wait for others to speak.";
+    }
+    var blocked = desc.filter(function(d) { return !d.included; });
+    if (blocked.length) {
+      return "Audio found but unavailable (" + blocked.map(function(d) { return d.reasons.join("+"); }).join(", ") + ").";
+    }
+    return "Preparing audio…";
+  }
+
+  function updateSources(remote) {
+    var node = document.querySelector("#orbit-sources");
+    if (node) {
+      node.textContent = sourceSummary(remote);
+    }
+    try {
+      window.__orbitTranslatorDebug = {
+        status: translation.status,
+        wantActive: translation.wantActive,
+        target: panel.target,
+        signature: translation.signature,
+        tracks: describeAudioTracks()
+      };
+    } catch (ignoredDebug) {
+      return;
+    }
+  }
+
+  function languageName(code) {
+    var list = panel.languages || [];
+    var index;
+    for (index = 0; index < list.length; index += 1) {
+      if (list[index] && list[index].code === code) {
+        return list[index].name || code;
       }
     }
-    return entry;
+    return code || "Translation";
+  }
+
+  // Resolve a Jitsi participant display name from the redux store, trying the
+  // shapes used across Jitsi releases. Falls back to null (caller labels).
+  function participantName(participantId) {
+    var store = appStore();
+    var state;
+    var slice;
+    if (!store || !participantId) {
+      return null;
+    }
+    try {
+      state = store.getState();
+    } catch (ignored) {
+      return null;
+    }
+    slice = state["features/base/participants"];
+    if (!slice) {
+      return null;
+    }
+    var list = [];
+    try {
+      if (Array.isArray(slice)) {
+        list = slice;
+      } else if (Array.isArray(slice.remote)) {
+        list = slice.remote;
+      } else if (slice.remote && typeof slice.remote.forEach === "function") {
+        slice.remote.forEach(function(p) {
+          list.push(p);
+        });
+      } else if (typeof slice === "object") {
+        Object.keys(slice).forEach(function(key) {
+          if (key === "local" || key === "remote") {
+            return;
+          }
+          list.push(slice[key]);
+        });
+        if (slice.local) {
+          list.push(slice.local);
+        }
+      }
+    } catch (ignoredCollect) {
+      return null;
+    }
+    var index;
+    for (index = 0; index < list.length; index += 1) {
+      var p = list[index];
+      if (!p) {
+        continue;
+      }
+      var id = p.id || p.participantId || p.endpointId || p.jwtId;
+      if (String(id) === String(participantId)) {
+        return p.name || p.displayName || p.displayname || null;
+      }
+    }
+    return null;
+  }
+
+  function dominantParticipantId(tracks) {
+    var store = appStore();
+    var state;
+    if (!store) {
+      return null;
+    }
+    try {
+      state = store.getState();
+    } catch (ignored) {
+      return null;
+    }
+    var speakers = state["features/base/participants"];
+    try {
+      if (speakers && speakers.dominantSpeakerId) {
+        return speakers.dominantSpeakerId;
+      }
+      if (speakers && speakers.dominantSpeaker) {
+        return speakers.dominantSpeaker.id || speakers.dominantSpeaker.participantId || null;
+      }
+    } catch (ignoredShape) {
+      return null;
+    }
+    void tracks;
+    return null;
+  }
+
+  function speakerLabelFor(tracks) {
+    if (!tracks || !tracks.length) {
+      return "";
+    }
+    var onlyScreenshare = tracks.every(function(track) {
+      return isScreenshareTrack(track);
+    });
+    if (onlyScreenshare) {
+      return "Shared screen";
+    }
+    var dominant = dominantParticipantId(tracks);
+    var name = dominant ? participantName(dominant) : null;
+    if (name) {
+      return name;
+    }
+    var ids = [];
+    tracks.forEach(function(track) {
+      var pid = track.participantId || (track.jitsiTrack && track.jitsiTrack.ownerEndpointId);
+      if (pid && ids.indexOf(pid) === -1) {
+        ids.push(pid);
+      }
+    });
+    if (ids.length === 1) {
+      return participantName(ids[0]) || "";
+    }
+    return "";
+  }
+
+  // Live MediaStreamTracks straight out of a Jitsi track wrapper — the way
+  // the working reference client feeds its AudioContext: direct streams, no
+  // hidden <audio> elements, no re-attach, no captureStream round-trip.
+  // Several accessor shapes are tried because lib-jitsi-meet exposes the
+  // underlying track differently across versions; only live audio tracks are
+  // collected.
+  function directAudioTracks(track) {
+    var found = [];
+    var seen = {};
+    function add(mediaTrack) {
+      if (!mediaTrack || typeof mediaTrack !== "object") {
+        return;
+      }
+      if (mediaTrack.kind && mediaTrack.kind !== "audio") {
+        return;
+      }
+      if (mediaTrack.readyState && mediaTrack.readyState !== "live") {
+        return;
+      }
+      if (typeof mediaTrack.id === "string" && mediaTrack.id) {
+        if (seen[mediaTrack.id]) {
+          return;
+        }
+        seen[mediaTrack.id] = true;
+      }
+      found.push(mediaTrack);
+    }
+    function addStream(stream) {
+      if (!stream || typeof stream.getAudioTracks !== "function") {
+        return;
+      }
+      var list = [];
+      try {
+        list = stream.getAudioTracks() || [];
+      } catch (ignoredList) {
+        return;
+      }
+      list.forEach(add);
+    }
+    var jt = (track && track.jitsiTrack) || {};
+    try {
+      if (typeof jt.getOriginalStream === "function") {
+        addStream(jt.getOriginalStream());
+      }
+    } catch (ignoredOriginal) {
+      return found;
+    }
+    try {
+      addStream(jt.stream);
+    } catch (ignoredJitsiStream) {
+      return found;
+    }
+    try {
+      addStream(track.stream);
+    } catch (ignoredWrapperStream) {
+      return found;
+    }
+    try {
+      add(jt.track);
+    } catch (ignoredJitsiTrack) {
+      return found;
+    }
+    try {
+      add(track.track);
+    } catch (ignoredWrapperTrack) {
+      return found;
+    }
+    return found;
   }
 
   function remoteMedia() {
     var tracks = remoteAudioTracks();
     var stream = new MediaStream();
     var signature = [];
-    var ready = true;
-    pruneHiddenAudio(tracks);
+    var seen = {};
     tracks.forEach(function(track) {
-      var entry = attachTrack(track);
-      signature.push(String(track.participantId || "remote"));
-      if (!entry || entry.failed || !entry.ready) {
-        ready = false;
-        return;
-      }
-      var captured = null;
-      try {
-        captured = entry.element.captureStream ? entry.element.captureStream() : null;
-      } catch (ignored) {
-        captured = null;
-      }
-      if (!captured) {
-        ready = false;
-        return;
-      }
-      captured.getAudioTracks().forEach(function(mediaTrack) {
-        if (mediaTrack && mediaTrack.readyState === "live" && !stream.getTrackById(mediaTrack.id)) {
-          stream.addTrack(mediaTrack);
+      signature.push(trackIdentity(track));
+      directAudioTracks(track).forEach(function(mediaTrack) {
+        if (!seen[mediaTrack.id]) {
+          seen[mediaTrack.id] = true;
+          try {
+            stream.addTrack(mediaTrack);
+          } catch (ignoredAdd) {
+            return;
+          }
         }
       });
     });
-    if (!stream.getAudioTracks().length || !ready) {
+    if (!stream.getAudioTracks().length) {
       return null;
     }
-    return { stream: stream, signature: signature.sort().join("|") };
+    return { stream: stream, signature: signature.sort().join("|"), tracks: tracks };
+  }
+
+  // Temporarily lower the original conference audio while translated speech
+  // plays, so the two voices do not compete at full volume. Only Jitsi's own
+  // audible <audio> elements are touched — translation output runs through
+  // WebAudio, so no exclusions are needed.
+  function jitsiAudioElements() {
+    return Array.prototype.slice.call(document.querySelectorAll("audio"));
+  }
+
+  function duckOriginals() {
+    if (translation.ducked) {
+      return;
+    }
+    translation.ducked = true;
+    if (translation.restoreTimer) {
+      window.clearTimeout(translation.restoreTimer);
+      translation.restoreTimer = null;
+    }
+    if (!translation.duckVolumes) {
+      translation.duckVolumes = [];
+      jitsiAudioElements().forEach(function(node) {
+        try {
+          translation.duckVolumes.push({ node: node, volume: node.volume });
+          node.volume = Math.min(node.volume, 0.15);
+        } catch (ignored) {
+          return;
+        }
+      });
+    } else {
+      jitsiAudioElements().forEach(function(node) {
+        try {
+          node.volume = Math.min(node.volume, 0.15);
+        } catch (ignoredVolume) {
+          return;
+        }
+      });
+    }
+  }
+
+  function restoreOriginals(immediate) {
+    if (!translation.ducked) {
+      return;
+    }
+    if (translation.restoreTimer) {
+      window.clearTimeout(translation.restoreTimer);
+      translation.restoreTimer = null;
+    }
+    if (immediate) {
+      restoreVolumes();
+      return;
+    }
+    var wait = 400;
+    try {
+      if (translation.output && translation.nextTime > translation.output.currentTime) {
+        wait = Math.min(2500, Math.max(400, (translation.nextTime - translation.output.currentTime) * 1000 + 250));
+      }
+    } catch (ignored) {
+      wait = 400;
+    }
+    translation.restoreTimer = window.setTimeout(restoreVolumes, wait);
+  }
+
+  function restoreVolumes() {
+    translation.restoreTimer = null;
+    translation.ducked = false;
+    (translation.duckVolumes || []).forEach(function(saved) {
+      try {
+        if (saved.node && saved.node.isConnected) {
+          saved.node.volume = saved.volume;
+        }
+      } catch (ignored) {
+        return;
+      }
+    });
+    translation.duckVolumes = null;
   }
 
   function setTranslationStatus(text, color) {
@@ -575,14 +1094,17 @@
 
   function setTranslationError(message) {
     translation.status = "error";
+    translation.wantActive = false;
     translation.error = message;
+    restoreOriginals(true);
     setTranslationStatus(message, "#ff9d94");
-    setTranslationText("source", translation.source || "Waiting for participant audio.");
+    setTranslationText("source", translation.source || "Waiting for audio to translate.");
     setTranslationText("translated", translation.translated || "Translation will appear here.");
     var retry = document.querySelector("#orbit-retry");
     if (retry) {
       retry.style.display = "block";
     }
+    refreshToggle();
   }
 
   function stopTranslation() {
@@ -590,6 +1112,7 @@
     translation.status = "idle";
     translation.error = "";
     translation.signature = "";
+    restoreOriginals(true);
     if (translation.socket) {
       try {
         translation.socket.close();
@@ -635,7 +1158,8 @@
       });
       translation.output = null;
     }
-    pruneHiddenAudio([]);
+    // Nothing to detach: input tracks come straight from the Jitsi tracks
+    // and were never attached to our own elements.
   }
 
   function floatToBase64(input) {
@@ -675,6 +1199,7 @@
     source.buffer = buffer;
     source.connect(output.destination);
     var startAt = Math.max(output.currentTime + 0.03, next.value);
+    duckOriginals();
     source.start(startAt);
     next.value = startAt + buffer.duration;
     translation.playing.push(source);
@@ -682,6 +1207,9 @@
       translation.playing = translation.playing.filter(function(item) {
         return item !== source;
       });
+      if (!translation.playing.length) {
+        restoreOriginals(false);
+      }
     };
   }
 
@@ -690,21 +1218,35 @@
     if (panel.active !== "translator") {
       return;
     }
+    if (!translation.wantActive) {
+      refreshToggle();
+      return;
+    }
     remote = remoteMedia();
     if (!remote) {
       if (translation.signature || translation.status === "connecting" || translation.status === "listening" || translation.status === "playing") {
         stopTranslation();
       }
       translation.status = "idle";
-      setTranslationStatus("Waiting for participant audio.", "#888");
-      setTranslationText("source", translation.source || "Waiting for participant audio.");
+      setTranslationStatus("Waiting for audio to translate.", "#888");
+      setTranslationText("source", translation.source || "Waiting for audio to translate.");
+      refreshToggle();
       return;
     }
     if (translation.socket && translation.signature === remote.signature + "|" + panel.target) {
+      var label = speakerLabelFor(remote.tracks);
+      if (label && label !== translation.speaker) {
+        translation.speaker = label;
+        updateSourceLabel();
+      }
+      refreshToggle();
       return;
     }
+    translation.speaker = speakerLabelFor(remote.tracks) || translation.speaker;
+    updateSourceLabel();
     stopTranslation();
     startTranslation(remote.stream, remote.signature + "|" + panel.target, panel.target);
+    refreshToggle();
   }
 
   function startTranslation(stream, signature, target) {
@@ -714,7 +1256,13 @@
     translation.error = "";
     translation.signature = signature;
     translation.source = "";
+    translation.sourceBuffer = "";
+    translation.sourceLang = "";
     translation.translated = "";
+    translation.translationBuffer = "";
+    translation.turnClosed = true;
+    updateTargetLabel();
+    updateSourceLabel();
     setTranslationStatus("Connecting…", "#ffd479");
     setTranslationText("source", "Listening…");
     setTranslationText("translated", "Translation will appear here.");
@@ -774,7 +1322,7 @@
   function openLiveSocket(stream, token, model, target, generation) {
     var socket;
     try {
-      socket = new WebSocket(LIVE_SOCKET_URL + "?key=" + encodeURIComponent(token));
+      socket = new WebSocket(LIVE_SOCKET_URL + "?access_token=" + encodeURIComponent(token));
     } catch (socketError) {
       setTranslationError("Translation could not start. Please try again.");
       stopTranslation();
@@ -792,23 +1340,58 @@
           model: model.indexOf("models/") === 0 ? model : "models/" + model,
           generationConfig: {
             responseModalities: ["AUDIO"],
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-            translationConfig: { targetLanguageCode: target, echoTargetLanguage: false }
-          }
+            // Must match the locked token config on the server exactly
+            // (see api.translate-token.ts) — same shape as the proven
+            // working reference app.
+            translationConfig: { targetLanguageCode: target, echoTargetLanguage: true }
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {}
         }
       }));
     };
+    // Server frames can arrive as string, Blob, or ArrayBuffer — decode all
+    // three before parsing, otherwise setupComplete and transcripts are lost.
+    function decodeSocketData(data) {
+      if (typeof data === "string") {
+        return Promise.resolve(data);
+      }
+      try {
+        if (typeof Blob !== "undefined" && data instanceof Blob) {
+          return data.text();
+        }
+      } catch (ignoredBlob) {
+        return Promise.resolve("");
+      }
+      try {
+        if (data instanceof ArrayBuffer) {
+          return Promise.resolve(new TextDecoder().decode(data));
+        }
+      } catch (ignoredBuffer) {
+        return Promise.resolve("");
+      }
+      return Promise.resolve("");
+    }
+
     socket.onmessage = function(event) {
-      var message;
       if (generation !== translation.generation) {
         return;
       }
-      try {
-        message = JSON.parse(event.data);
-      } catch (parseError) {
-        return;
-      }
+      decodeSocketData(event.data).then(function(text) {
+        var message;
+        if (generation !== translation.generation || !text) {
+          return;
+        }
+        try {
+          message = JSON.parse(text);
+        } catch (parseError) {
+          return;
+        }
+        handleLiveMessage(message, stream, generation);
+      });
+    };
+
+  function handleLiveMessage(message, stream, generation) {
       if (message.setupComplete) {
         translation.status = "listening";
         setTranslationStatus("Listening for remote speech.", "#8fd49a");
@@ -829,15 +1412,50 @@
         });
         translation.playing = [];
         translation.nextTime = translation.output ? translation.output.currentTime : 0;
+        restoreOriginals(true);
       }
+      // Transcripts arrive as incremental chunks — accumulate them like the
+      // reference client instead of overwriting, so partial text no longer
+      // flickers or shows only the latest fragment. A new turn resets the
+      // buffers; turnComplete closes the turn.
       if (content.inputTranscription && content.inputTranscription.text) {
-        translation.source = content.inputTranscription.text;
+        if (translation.turnClosed) {
+          translation.sourceBuffer = "";
+          translation.translationBuffer = "";
+          translation.turnClosed = false;
+        }
+        translation.sourceBuffer += content.inputTranscription.text;
+        if (content.inputTranscription.languageCode) {
+          translation.sourceLang = content.inputTranscription.languageCode;
+        }
+        var freshTracks = null;
+        try {
+          var fresh = remoteMedia();
+          freshTracks = fresh ? fresh.tracks : null;
+        } catch (ignoredFresh) {
+          freshTracks = null;
+        }
+        if (freshTracks) {
+          var freshLabel = speakerLabelFor(freshTracks);
+          if (freshLabel) {
+            translation.speaker = freshLabel;
+          }
+        }
+        updateSourceLabel();
+        translation.source = translation.sourceBuffer.trim();
         setTranslationText("source", translation.source);
       }
       if (content.outputTranscription && content.outputTranscription.text) {
-        translation.translated = content.outputTranscription.text;
+        if (translation.turnClosed) {
+          translation.sourceBuffer = "";
+          translation.translationBuffer = "";
+          translation.turnClosed = false;
+        }
+        translation.translationBuffer += content.outputTranscription.text;
+        translation.translated = translation.translationBuffer.trim();
         translation.status = "playing";
         setTranslationStatus("Playing translation.", "#8fd49a");
+        updateTargetLabel();
         setTranslationText("translated", translation.translated);
       }
       (content.modelTurn && content.modelTurn.parts ? content.modelTurn.parts : []).forEach(function(part) {
@@ -851,10 +1469,13 @@
         }
       });
       if (content.turnComplete) {
+        translation.turnClosed = true;
         translation.status = "listening";
         setTranslationStatus("Listening for remote speech.", "#8fd49a");
+        restoreOriginals(false);
       }
-    };
+  }
+
     socket.onerror = function() {
       if (generation !== translation.generation) {
         return;
@@ -908,6 +1529,86 @@
     return output;
   }
 
+  // AudioWorklet capture ported from the working reference client
+  // (audio.ts `relay-capture` processor). ScriptProcessor is deprecated and
+  // throttled on some platforms; the worklet path is preferred with a
+  // ScriptProcessor fallback where AudioWorklet is unavailable.
+  var CAPTURE_WORKLET_SOURCE = "class CaptureProcessor extends AudioWorkletProcessor{process(inputs){var channel=inputs[0]&&inputs[0][0];if(channel){this.port.postMessage(channel);}return true;}}registerProcessor(\"orbit-capture\",CaptureProcessor);";
+
+  function sendInputFrame(frame, input, generation) {
+    var socket = translation.socket;
+    if (generation !== translation.generation || !socket || socket.readyState !== 1) {
+      return;
+    }
+    var live = downsample(frame, input.sampleRate);
+    socket.send(JSON.stringify({
+      realtimeInput: {
+        audio: { data: floatToBase64(live), mimeType: "audio/pcm;rate=16000" }
+      }
+    }));
+  }
+
+  function startScriptCapture(input, mix, generation) {
+    var processor = input.createScriptProcessor(2048, 1, 1);
+    processor.onaudioprocess = function(event) {
+      event.outputBuffer.getChannelData(0).fill(0);
+      sendInputFrame(event.inputBuffer.getChannelData(0), input, generation);
+    };
+    var silent = input.createGain();
+    silent.gain.value = 0;
+    mix.connect(processor);
+    processor.connect(silent);
+    silent.connect(input.destination);
+    translation.processor = processor;
+  }
+
+  function startWorkletCapture(input, mix, generation) {
+    var url;
+    try {
+      url = URL.createObjectURL(new Blob([CAPTURE_WORKLET_SOURCE], { type: "text/javascript" }));
+    } catch (urlError) {
+      startScriptCapture(input, mix, generation);
+      return;
+    }
+    input.audioWorklet.addModule(url).then(function() {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (ignoredRevoke) {
+        return;
+      }
+      if (generation !== translation.generation || translation.processor) {
+        return;
+      }
+      var node = new AudioWorkletNode(input, "orbit-capture");
+      node.port.onmessage = function(event) {
+        sendInputFrame(event.data, input, generation);
+      };
+      var silent = input.createGain();
+      silent.gain.value = 0;
+      mix.connect(node);
+      node.connect(silent);
+      silent.connect(input.destination);
+      translation.processor = node;
+    }).catch(function() {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (ignoredFallbackRevoke) {
+        return;
+      }
+      if (generation !== translation.generation || translation.processor) {
+        return;
+      }
+      try {
+        startScriptCapture(input, mix, generation);
+      } catch (fallbackError) {
+        setTranslationError("This browser cannot capture remote meeting audio.");
+        stopTranslation();
+        translation.status = "error";
+        setTranslationError("This browser cannot capture remote meeting audio.");
+      }
+    });
+  }
+
   function startInput(stream, generation) {
     var input = translation.input;
     var socket = translation.socket;
@@ -916,24 +1617,14 @@
     }
     try {
       var source = input.createMediaStreamSource(stream);
-      var processor = input.createScriptProcessor(2048, 1, 1);
-      processor.onaudioprocess = function(event) {
-        var live;
-        if (generation !== translation.generation || !translation.socket || translation.socket.readyState !== 1) {
-          return;
-        }
-        live = downsample(event.inputBuffer.getChannelData(0), input.sampleRate);
-        event.outputBuffer.getChannelData(0).fill(0);
-        socket.send(JSON.stringify({
-          realtimeInput: {
-            audio: { data: floatToBase64(live), mimeType: "audio/pcm;rate=16000" }
-          }
-        }));
-      };
-      source.connect(processor);
-      processor.connect(input.destination);
+      var mix = input.createGain();
+      source.connect(mix);
       translation.sourceNode = source;
-      translation.processor = processor;
+      if (input.audioWorklet) {
+        startWorkletCapture(input, mix, generation);
+      } else {
+        startScriptCapture(input, mix, generation);
+      }
     } catch (inputError) {
       setTranslationError("This browser cannot capture remote meeting audio.");
       stopTranslation();
