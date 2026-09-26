@@ -91,16 +91,30 @@
   function panelHost() {
     var root = document.getElementById("custom-panel");
     var index;
-    if (!root) {
-      return null;
-    }
-    for (index = 0; index < root.children.length; index += 1) {
-      var child = root.children[index];
-      if (String(child.className || "").indexOf("contentContainer") !== -1) {
-        return child;
+    if (root) {
+      for (index = 0; index < root.children.length; index += 1) {
+        var child = root.children[index];
+        if (String(child.className || "").indexOf("contentContainer") !== -1) {
+          return child;
+        }
       }
     }
-    return null;
+    return document.getElementById("orbit-panel-fallback-content");
+  }
+
+  function ensureFallbackPanel() {
+    if (!panel.active || document.getElementById("custom-panel") || document.getElementById("orbit-panel-fallback")) {
+      return;
+    }
+    var root = element("div", {
+      id: "orbit-panel-fallback",
+      style: "position:fixed;left:0;top:0;bottom:0;width:min(380px,100vw);z-index:10000;background:#1c1f24;color:#fff;box-shadow:8px 0 28px rgba(0,0,0,.38);display:flex;flex-direction:column;"
+    });
+    root.appendChild(element("div", {
+      id: "orbit-panel-fallback-content",
+      style: "display:flex;flex:1;min-height:0;overflow:hidden;"
+    }));
+    document.body.appendChild(root);
   }
 
   function setPanelSide(mode) {
@@ -129,6 +143,14 @@
 
   function closeWrapper() {
     var store = appStore();
+    var host = panelHost();
+    if (host) {
+      host.innerHTML = "";
+    }
+    var fallback = document.getElementById("orbit-panel-fallback");
+    if (fallback && fallback.parentNode) {
+      fallback.parentNode.removeChild(fallback);
+    }
     panel.active = null;
     setPanelSide(null);
     try {
@@ -136,29 +158,30 @@
         store.dispatch({ type: "CUSTOM_PANEL_CLOSE" });
       }
     } catch (ignored) {
-      return;
-    }
-    var host = panelHost();
-    if (host) {
-      host.innerHTML = "";
+      // The fallback panel is already closed even if Jitsi's panel action is unavailable.
     }
   }
 
   function openPanel(mode) {
     var store = appStore();
-    if (!store) {
-      return;
-    }
-    try {
-      store.dispatch({ type: "SET_CUSTOM_PANEL_ENABLED", enabled: true });
-      store.dispatch({ type: "CUSTOM_PANEL_OPEN" });
-    } catch (ignored) {
-      return;
-    }
     panel.active = mode;
     setPanelSide(mode);
+    if (store) {
+      try {
+        store.dispatch({ type: "SET_CUSTOM_PANEL_ENABLED", enabled: true });
+        store.dispatch({ type: "CUSTOM_PANEL_OPEN" });
+      } catch (ignored) {
+        // A DOM fallback is mounted below if this Jitsi build cannot open custom-panel.
+      }
+    }
     window.setTimeout(renderActivePanel, 60);
     window.setTimeout(renderActivePanel, 450);
+    window.setTimeout(function() {
+      if (!document.getElementById("custom-panel")) {
+        ensureFallbackPanel();
+      }
+      renderActivePanel();
+    }, 700);
   }
 
   function togglePanel(mode) {
@@ -246,7 +269,8 @@
   function renderActivePanel() {
     var host = panelHost();
     var state = panelState();
-    if (!host || !panel.active || !state || !state.isOpen) {
+    var fallbackOpen = Boolean(document.getElementById("orbit-panel-fallback"));
+    if (!host || !panel.active || ((!state || !state.isOpen) && !fallbackOpen)) {
       return;
     }
     var marker = host.querySelector("[data-orbit-panel='" + panel.active + "']");
