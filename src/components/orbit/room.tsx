@@ -184,7 +184,7 @@ export function Room({ room, media }: { room: string; media: LocalMedia }) {
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       setShareStream(stream);
       setSharing(true);
       stream.getVideoTracks()[0]?.addEventListener("ended", () => {
