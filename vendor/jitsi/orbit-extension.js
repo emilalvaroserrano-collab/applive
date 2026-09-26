@@ -326,6 +326,9 @@
     });
     top.appendChild(label);
     top.appendChild(select);
+    top.appendChild(element("div", {
+      style: "margin-top:7px;font-size:11px;line-height:1.35;opacity:.65;"
+    }, ["Google Translate language catalog. Languages not currently supported by Gemini Live speech translation are shown but disabled."]));
     body.appendChild(top);
 
     var statusRow = element("div", { style: "display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid rgba(128,128,128,.35);font-size:13px;opacity:.9;" });
@@ -385,11 +388,16 @@
         return;
       }
       languages.forEach(function(language) {
-        if (!language || !language.code) {
+        if (!language || !language.name) {
           return;
         }
-        var option = element("option", { value: language.code, text: language.name || language.code });
-        if (language.code === panel.target) {
+        var liveCode = language.code || "";
+        var option = element("option", { value: liveCode, text: language.name });
+        if (!language.liveSupported || !liveCode) {
+          option.disabled = true;
+          option.setAttribute("data-live-supported", "false");
+        }
+        if (liveCode && liveCode === panel.target) {
           option.selected = true;
         }
         select.appendChild(option);
