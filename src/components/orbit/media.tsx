@@ -43,9 +43,13 @@ export function useLocalMedia(wantAudio: boolean, wantVideo: boolean): LocalMedi
       }
 
       const audio = wantAudio
-        ? micId
-          ? { deviceId: { exact: micId } }
-          : true
+        ? {
+            ...(micId ? { deviceId: { exact: micId } } : {}),
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1,
+          }
         : false;
       const video = wantVideo
         ? cameraId

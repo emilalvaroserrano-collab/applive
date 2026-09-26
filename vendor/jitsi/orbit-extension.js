@@ -7,6 +7,7 @@
   var DONATION_AMOUNTS = [10, 25, 50, 100];
   var panel = { active: null, target: "en", languages: null, languagesLoading: false };
   var translation = {
+    enabled: false,
     status: "idle",
     error: "",
     source: "",
@@ -33,7 +34,8 @@
     shareAudioCount: 0,
     screenShareActive: false,
     packetsSent: 0,
-    lastInputPeak: 0
+    lastInputPeak: 0,
+    capturedShareStream: null
   };
   var lastAction = { key: "", time: 0 };
 
@@ -129,7 +131,6 @@
     var store = appStore();
     panel.active = null;
     setPanelSide(null);
-    stopTranslation();
     try {
       if (store) {
         store.dispatch({ type: "CUSTOM_PANEL_CLOSE" });
@@ -165,9 +166,10 @@
     if (panel.active === mode && state && state.isOpen) {
       closeWrapper();
     } else {
-      stopTranslation(false);
       if (mode === "translator") {
+        translation.enabled = true;
         primeTranslationAudio();
+        syncTranslation();
       }
       openPanel(mode);
     }
@@ -337,6 +339,23 @@
       style: "padding:7px 14px;border-bottom:1px solid rgba(128,128,128,.25);font-size:11px;line-height:1.35;opacity:.68;"
     }, ["Audio sources: 0 • PCM packets: 0"]));
 
+    var controlRow = element("div", { style: "padding:8px 14px;border-bottom:1px solid rgba(128,128,128,.25);" });
+    var stopButton = element("button", {
+      id: "orbit-stop-translation",
+      type: "button",
+      style: "width:100%;height:38px;border-radius:8px;border:1px solid rgba(128,128,128,.5);background:rgba(255,255,255,.06);color:inherit;font-size:13px;font-weight:600;cursor:pointer;"
+    }, ["Stop translator"]);
+    stopButton.addEventListener("click", function() {
+      translation.enabled = false;
+      stopTranslation(false);
+      setTranslationStatus("Translator stopped.", "#888");
+      setTranslationDebug("Audio sources: 0 • PCM packets: 0");
+      stopButton.textContent = "Translator stopped";
+      stopButton.disabled = true;
+    });
+    controlRow.appendChild(stopButton);
+    body.appendChild(controlRow);
+
     var scroll = element("div", { style: "flex:1;min-height:0;overflow-y:auto;padding:12px 14px 16px;" });
     scroll.appendChild(element("div", { style: "font-size:12px;font-weight:700;opacity:.75;margin-bottom:4px;" }, ["Original"]));
     scroll.appendChild(element("div", { id: "orbit-source-text", style: "font-size:14px;line-height:1.45;margin-bottom:14px;" }, ["Waiting for participant audio."]));
@@ -470,6 +489,147 @@
       });
   }
 
+  function supportedConstraint(name) {
+    try {
+      var supported = navigator.mediaDevices && navigator.mediaDevices.getSupportedConstraints
+        ? navigator.mediaDevices.getSupportedConstraints()
+        : {};
+      return supported[name] !== false;
+    } catch (ignored) {
+      return true;
+    }
+  }
+
+  function voiceAudioConstraints(value) {
+    var next = {};
+    var key;
+    if (value && typeof value === "object") {
+      for (key in value) {
+        if (Object.prototype.hasOwnProperty.call(value, key)) {
+          next[key] = value[key];
+        }
+      }
+    }
+    if (supportedConstraint("echoCancellation")) {
+      next.echoCancellation = true;
+    }
+    if (supportedConstraint("noiseSuppression")) {
+      next.noiseSuppression = true;
+    }
+    if (supportedConstraint("autoGainControl")) {
+      next.autoGainControl = true;
+    }
+    if (supportedConstraint("channelCount")) {
+      next.channelCount = 1;
+    }
+    if (supportedConstraint("voiceIsolation")) {
+      next.voiceIsolation = true;
+    }
+    return next;
+  }
+
+  function rememberShareStream(stream) {
+    if (!stream || typeof stream.getTracks !== "function") {
+      return stream;
+    }
+    translation.capturedShareStream = stream;
+    var onEnded = function() {
+      window.setTimeout(function() {
+        if (translation.capturedShareStream !== stream) {
+          return;
+        }
+        var live = stream.getTracks().some(function(track) {
+          return track.readyState === "live";
+        });
+        if (!live) {
+          translation.capturedShareStream = null;
+        }
+        if (translation.enabled) {
+          syncTranslation();
+        }
+      }, 0);
+    };
+    stream.getTracks().forEach(function(track) {
+      track.addEventListener("ended", onEnded, { once: true });
+    });
+    if (translation.enabled) {
+      window.setTimeout(syncTranslation, 0);
+    }
+    return stream;
+  }
+
+  function installMediaCaptureBridge() {
+    var devices = navigator.mediaDevices;
+    if (!devices) {
+      return;
+    }
+
+    if (typeof devices.getUserMedia === "function" && !devices.getUserMedia.orbitWrapped) {
+      var originalGetUserMedia = devices.getUserMedia;
+      var wrappedGetUserMedia = function(constraints) {
+        var next = constraints || {};
+        var copied = {};
+        var key;
+        for (key in next) {
+          if (Object.prototype.hasOwnProperty.call(next, key)) {
+            copied[key] = next[key];
+          }
+        }
+        if (copied.audio) {
+          copied.audio = voiceAudioConstraints(copied.audio);
+        }
+        return originalGetUserMedia.call(devices, copied);
+      };
+      wrappedGetUserMedia.orbitWrapped = true;
+      try {
+        devices.getUserMedia = wrappedGetUserMedia;
+      } catch (ignoredUserMediaPatch) {
+        // Some WebViews expose read-only media methods. Jitsi's own AEC/NS/AGC
+        // flags below still keep the microphone on the voice-processing path.
+      }
+    }
+
+    if (typeof devices.getDisplayMedia === "function" && !devices.getDisplayMedia.orbitWrapped) {
+      var originalGetDisplayMedia = devices.getDisplayMedia;
+      var wrappedGetDisplayMedia = function(constraints) {
+        var requested = constraints || {};
+        var enhanced = {};
+        var key;
+        for (key in requested) {
+          if (Object.prototype.hasOwnProperty.call(requested, key)) {
+            enhanced[key] = requested[key];
+          }
+        }
+        enhanced.video = requested.video === false ? true : (requested.video || true);
+        enhanced.audio = {
+          suppressLocalAudioPlayback: false
+        };
+        enhanced.systemAudio = "include";
+        enhanced.surfaceSwitching = "include";
+        enhanced.selfBrowserSurface = "exclude";
+
+        return originalGetDisplayMedia.call(devices, enhanced)
+          .then(rememberShareStream)
+          .catch(function(error) {
+            var name = error && error.name ? String(error.name) : "";
+            if (name === "NotAllowedError" || name === "SecurityError" || name === "AbortError") {
+              throw error;
+            }
+            // Browser/OS combinations differ on system-audio support. If an
+            // enhanced capture constraint is unsupported, preserve screen
+            // sharing by retrying the original Jitsi request.
+            return originalGetDisplayMedia.call(devices, requested).then(rememberShareStream);
+          });
+      };
+      wrappedGetDisplayMedia.orbitWrapped = true;
+      try {
+        devices.getDisplayMedia = wrappedGetDisplayMedia;
+      } catch (ignoredDisplayMediaPatch) {
+        // The Redux/Jitsi original-stream path below remains the fallback.
+      }
+    }
+  }
+
   function audioContextConstructor() {
     return window.AudioContext || window.webkitAudioContext || null;
   }
@@ -547,6 +707,21 @@
     }
     state = store.getState();
     tracks = state["features/base/tracks"] || [];
+
+    // The browser capture bridge keeps the original getDisplayMedia stream.
+    // This is the most reliable place to retrieve local tab/system audio,
+    // because Jitsi may retain only the desktop video track in Redux.
+    if (translation.capturedShareStream && typeof translation.capturedShareStream.getTracks === "function") {
+      var capturedTracks = translation.capturedShareStream.getTracks();
+      result.screenShareActive = capturedTracks.some(function(track) {
+        return track.kind === "video" && track.readyState === "live";
+      });
+      translation.capturedShareStream.getAudioTracks().forEach(function(audioTrack) {
+        if (addTranslationTrack(result, audioTrack, "captured-share:" + String(audioTrack.id || "audio"))) {
+          result.shareAudioCount += 1;
+        }
+      });
+    }
 
     tracks.forEach(function(track) {
       var jitsiTrack = track && track.jitsiTrack;
@@ -663,6 +838,24 @@
       parts.push("signal: " + Math.round((translation.lastInputPeak || 0) * 100) + "%");
     }
     setTranslationDebug(parts.join(" • "));
+  }
+
+  function mergeTranscript(previous, incoming) {
+    var before = String(previous || "").trim();
+    var next = String(incoming || "").trim();
+    if (!next) {
+      return before;
+    }
+    if (!before) {
+      return next;
+    }
+    if (next.indexOf(before) === 0) {
+      return next;
+    }
+    if (before.indexOf(next) !== -1) {
+      return before;
+    }
+    return (before + " " + next).replace(/\s+/g, " ").trim();
   }
 
   function setTranslationText(kind, text) {
@@ -833,7 +1026,7 @@
   function syncTranslation() {
     var media;
     var expectedSignature;
-    if (panel.active !== "translator") {
+    if (!translation.enabled) {
       return;
     }
     media = translationMedia();
@@ -936,7 +1129,7 @@
 
   function scheduleReconnect(generation) {
     var delay;
-    if (generation !== translation.generation || panel.active !== "translator" || translation.reconnectTimer) {
+    if (generation !== translation.generation || !translation.enabled || translation.reconnectTimer) {
       return;
     }
     translation.reconnectAttempts += 1;
@@ -946,7 +1139,7 @@
       var target = translation.target;
       translation.reconnectTimer = window.setTimeout(function() {
         translation.reconnectTimer = null;
-        if (generation !== translation.generation || panel.active !== "translator") {
+        if (generation !== translation.generation || !translation.enabled) {
           return;
         }
         stopTranslation(true);
@@ -961,7 +1154,7 @@
     setTranslationStatus("Reconnecting translation…", "#ffd479");
     translation.reconnectTimer = window.setTimeout(function() {
       translation.reconnectTimer = null;
-      if (generation !== translation.generation || panel.active !== "translator") {
+      if (generation !== translation.generation || !translation.enabled) {
         return;
       }
       openLiveSocket(
@@ -1037,11 +1230,11 @@
         stopOutputPlayback();
       }
       if (content.inputTranscription && content.inputTranscription.text) {
-        translation.source = content.inputTranscription.text;
+        translation.source = mergeTranscript(translation.source, content.inputTranscription.text);
         setTranslationText("source", translation.source);
       }
       if (content.outputTranscription && content.outputTranscription.text) {
-        translation.translated = content.outputTranscription.text;
+        translation.translated = mergeTranscript(translation.translated, content.outputTranscription.text);
         translation.status = "playing";
         setTranslationStatus("Playing translation.", "#8fd49a");
         setTranslationText("translated", translation.translated);
@@ -1180,7 +1373,7 @@
       return;
     }
     wrapNotify();
-    if (panel.active === "translator") {
+    if (translation.enabled) {
       syncTranslation();
     }
     var state = panelState();
@@ -1196,6 +1389,7 @@
       window.setTimeout(boot, 250);
       return;
     }
+    installMediaCaptureBridge();
     wrapNotify();
     injectPanelSideStyle();
     document.addEventListener("click", documentClick, true);

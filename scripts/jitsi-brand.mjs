@@ -50,6 +50,8 @@ const LOCAL = {
 const cache = new Map();
 
 const ASSET_EXT = /\.(js|mjs|css|map|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|mp3|wav|wasm|json|webmanifest)$/i;
+const MEDIA_PERMISSIONS_POLICY =
+  "camera=(self), microphone=(self), display-capture=(self), fullscreen=(self), autoplay=(self)";
 
 export function passesThrough(pathname) {
   return (
@@ -142,7 +144,11 @@ export async function handleJitsiRequest(urlString, method, accept) {
   if (method === "GET" && (String(accept || "").includes("text/html") || !pathname.includes("."))) {
     return {
       status: 200,
-      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" },
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-cache",
+        "permissions-policy": MEDIA_PERMISSIONS_POLICY,
+      },
       body: indexHtml(),
     };
   }
